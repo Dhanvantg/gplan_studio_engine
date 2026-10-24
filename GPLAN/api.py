@@ -1454,6 +1454,20 @@ def rectangularize_output(ui, fixed_rooms=None):
         params = getattr(ui, "min_dim_inputs", None)
         fixed_rooms = (getattr(params, "get_fixed_rooms", lambda: [])()
                        if params is not None else [])
+    params = getattr(ui, "min_dim_inputs", None)
+    if getattr(params, "strict_room_bounds", False):
+        from GPLAN.source.dimensioning.room_constraints import constrain_plan
+        kept = []
+        for plan in ui.get_output_data():
+            candidate, failures = constrain_plan(plan, params.room_nodes, ui.get_edges(), strict=True)
+            if candidate is None:
+                from GPLAN.source.dimensioning.room_constraints import unique_violations
+                ui._room_constraint_failures = unique_violations(
+                    getattr(ui, "_room_constraint_failures", []) + failures)
+            if candidate is not None and (not fixed_rooms or plan_satisfies_fixed(candidate, fixed_rooms)):
+                kept.append(candidate)
+        ui._set_output_data(kept)
+        return kept
     locked = {spec["room"] for spec in fixed_rooms or []}
     kept = []
     caps_broken = False
@@ -2116,6 +2130,12 @@ class _DoorProgressCollector:
                         float(self.dim_inputs["plot_height"]))):
                 return entry
 
+        if self.dim_inputs.get("strict_room_bounds"):
+            from GPLAN.source.dimensioning.room_constraints import constrain_plan
+            plan, _ = constrain_plan(plan, self.nodes_list, self.edges_list, strict=True)
+            if plan is None:
+                return entry
+
         serialized = _serialize_graph_plan(plan, self.nodes_list)
         shortfalls = _metric_shortfalls(
             plan.final_traversal, self.nodes_list, self.edges_list,
@@ -2302,6 +2322,8 @@ class Documents:
             # answer rather than leaving it to be inferred.
             doc_dict["plot_fit"] = self.plot_fit
 
+        if hasattr(self, "room_constraints"):
+            doc_dict["room_constraints"] = self.room_constraints
         return {
             "Documents": doc_dict
         }
@@ -2328,9 +2350,9 @@ class Documents:
             # min_ratio/max_ratio ride along for the post-solve band
             # (_room_bounds / repair_dimensions / post-processing). The min-dim
             # SOLVER still ignores them; see minimum_dimensioning.input_constraints.
-            dim_parameters = DimParameters(min_width=dim_inputs['min_width'], min_height=dim_inputs['min_height'],max_width=dim_inputs['max_width'], max_height=dim_inputs['max_height'], min_ratio=dim_inputs.get('min_ratio', []), max_ratio=dim_inputs.get('max_ratio', []), min_area=dim_inputs.get('min_area', []), max_area=dim_inputs.get('max_area', []), plot_width=dim_inputs['plot_width'], plot_height=dim_inputs['plot_height'], isOptimalEnabled=dim_inputs['optimal_floorplan'],isRotationAllowed = dim_inputs['rotation_enabled'], enforce_plot=dim_inputs.get('enforce_plot', False), fixed_rooms=fixed_rooms)
+            dim_parameters = DimParameters(min_width=dim_inputs['min_width'], min_height=dim_inputs['min_height'],max_width=dim_inputs['max_width'], max_height=dim_inputs['max_height'], min_ratio=dim_inputs.get('min_ratio', []), max_ratio=dim_inputs.get('max_ratio', []), min_area=dim_inputs.get('min_area', []), max_area=dim_inputs.get('max_area', []), plot_width=dim_inputs['plot_width'], plot_height=dim_inputs['plot_height'], isOptimalEnabled=dim_inputs['optimal_floorplan'],isRotationAllowed = dim_inputs['rotation_enabled'], enforce_plot=dim_inputs.get('enforce_plot', False), fixed_rooms=fixed_rooms, strict_room_bounds=dim_inputs.get('strict_room_bounds', False), room_nodes=nodes_list, use_requested_room_bounds=dim_inputs.get('use_requested_room_bounds', False))
         elif dimensioned:
-            dim_parameters = DimParameters(min_width=dim_inputs['min_width'], min_height=dim_inputs['min_height'], max_width=dim_inputs['max_width'], max_height=dim_inputs['max_height'], min_ratio=dim_inputs['min_ratio'], max_ratio=dim_inputs['max_ratio'], plot_width=dim_inputs['plot_width'], plot_height=dim_inputs['plot_height'], symmetric=dim_inputs['symmetric'], isOptimalEnabled=dim_inputs['optimal_floorplan'])
+            dim_parameters = DimParameters(min_width=dim_inputs['min_width'], min_height=dim_inputs['min_height'], max_width=dim_inputs['max_width'], max_height=dim_inputs['max_height'], min_ratio=dim_inputs['min_ratio'], max_ratio=dim_inputs['max_ratio'], plot_width=dim_inputs['plot_width'], plot_height=dim_inputs['plot_height'], symmetric=dim_inputs['symmetric'], isOptimalEnabled=dim_inputs['optimal_floorplan'], strict_room_bounds=dim_inputs.get('strict_room_bounds', False), room_nodes=nodes_list, use_requested_room_bounds=dim_inputs.get('use_requested_room_bounds', False))
         ui = GuiParameters(graph=graph).set_isDimensioned(dimensioned).set_isDimensionedCirculation(
             dimensionedCirculation).set_isMinDimensioned(minDimEnabled).set_isRemoveAddCirculation(
             removeAddCirculation).set_isPublic(publicEnabled).set_min_dim_inputs(dim_parameters).set_isCirculation(circulationEnabled)
@@ -2459,7 +2481,7 @@ class Documents:
                         fixed_rooms, cardinal_pairs, postProcessEnabled,
                         postprocess_options, dim_inputs, documentID, name,
                         count, limit)
-                if not non_adj_edge_list and not fixed_rooms:
+                if not non_adj_edge_list and not fixed_rooms and not dim_inputs.get("strict_room_bounds"):
                     # One-connected graphs (two wings joined by one cut-vertex
                     # room) compose better as stacked component duals than
                     # through biconnectivity augmentation, which invents a
@@ -2502,6 +2524,19 @@ class Documents:
                             response.floorplans = new_plans
                             response.postprocess = pp_reports
                             message += pp_note
+                        from GPLAN.source.dimensioning.room_constraints import validate
+                        reports = []
+                        by_name = {n["label"]: n for n in nodes_list}
+                        for plan in response.floorplans:
+                            ordered_nodes = [by_name.get(r["name"], {}) for r in plan]
+                            failures = validate([r["circular_coordinates"] for r in plan], ordered_nodes)
+                            reports.append({"satisfied": not failures, "violations": failures,
+                                            "relaxed": bool(failures)})
+                        response.room_constraints = {
+                            "mode": "best_effort", "plans": reports,
+                            "status": "relaxed" if any(r["violations"] for r in reports) else "satisfied",
+                            "failed_bounds": [],
+                        }
                         _publish_progress_snapshot(
                             progress_callback, response, message,
                             len(response.floorplans))
@@ -2738,7 +2773,41 @@ class Documents:
         if disclose_plot_fit:
             response.plot_fit = plot_fit_reports
 
+        from GPLAN.source.dimensioning.room_constraints import constrain_plan, unique_violations
+        strict_rooms = bool(dim_inputs.get("strict_room_bounds"))
+        constraint_reports, rejected, accepted = [], [], []
+        accepted_indices = []
+        for item_index, item in enumerate(outputData):
+            checked, violations = constrain_plan(item, nodes_list, edges_list, strict=strict_rooms)
+            if checked is None:
+                rejected.extend(violations)
+            else:
+                accepted.append(checked)
+                accepted_indices.append(item_index)
+                constraint_reports.append({"satisfied": not violations, "violations": violations,
+                                           "relaxed": bool(violations) and not strict_rooms})
+        outputData = accepted
+        if response.postprocess is not None:
+            response.postprocess = [response.postprocess[i] for i in accepted_indices
+                                    if i < len(response.postprocess)]
+        response.room_constraints = {
+            "mode": "strict" if strict_rooms else "best_effort",
+            "status": "infeasible" if not accepted else ("relaxed" if any(r["violations"] for r in constraint_reports) else "satisfied"),
+            "plans": constraint_reports[:min(limit, count)],
+            "failed_bounds": unique_violations(rejected + getattr(ui, "_room_constraint_failures", [])) if not accepted else [],
+        }
+        if strict_rooms and not accepted:
+            # A solver-infeasible topology has no final dimensions to measure.
+            # Report the requested bounds as candidates, without claiming an IIS.
+            response.room_constraints["requested_bounds"] = [
+                {"room_id": n.get("id"), "label": n.get("label"),
+                 "width": n.get("width"), "height": n.get("height"),
+                 "min_area": n.get("min_area"), "max_area": n.get("max_area")}
+                for n in nodes_list]
+            message += " No plan satisfies the requested hard room bounds and required connections."
+
         serialization_count = min(min(len(outputData), limit), count)
+        response.count = serialization_count
         for index in range(serialization_count):
             floorplanData = outputData[index].final_traversal
             response.floorplans.append(

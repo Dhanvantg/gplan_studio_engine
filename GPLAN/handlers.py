@@ -342,6 +342,30 @@ def get_max_dims(ui):
 ENFORCE_PLOT_TOPUP_TARGET = 30
 
 
+def _allocation_rooms(ui):
+    from GPLAN.source.dimensioning.allocator import WALL_ALLOWANCE_FT
+    nodes = getattr(ui.min_dim_inputs, "room_nodes", [])
+    if not nodes or (not getattr(ui.min_dim_inputs, "strict_room_bounds", False)
+                     and not getattr(ui.min_dim_inputs, "use_requested_room_bounds", False)
+                     and not any("priority" in n for n in nodes)):
+        return [{"name": name} for name in ui.get_roomNames()]
+    rooms = []
+    for node in nodes:
+        room = {"name": node.get("label", "Room")}
+        if "priority" in node:
+            room["priority"] = node["priority"]
+        for axis in ("width", "height"):
+            for bound in ("min", "max"):
+                value = (node.get(axis) or {}).get(bound)
+                if isinstance(value, (int, float)) and 0 < value < 99999:
+                    room[bound + "_" + axis] = max(0.001, value - WALL_ALLOWANCE_FT)
+        for key in ("min_area", "max_area"):
+            if node.get(key):
+                room[key] = node[key]
+        rooms.append(room)
+    return rooms
+
+
 def solve_min_dim(floorplan_data, plot_width, plot_height, capped,
                   fixed_indices=None):
     """min_dim.main with a relaxation ladder.
@@ -372,6 +396,9 @@ def solve_min_dim(floorplan_data, plot_width, plot_height, capped,
     retry_data = copy.deepcopy(floorplan_data)
     status, out_data = min_dim.main(floorplan_data, plot_width, plot_height)
     if status:
+        return status, out_data, False
+    if retry_data.get('strict_room_bounds'):
+        # Hard ceilings and mandatory door lengths survive every retry.
         return status, out_data, False
     # Overlap relaxes BEFORE the ceilings release: a sliver wall is a
     # disclosed shortfall, a released ceiling can inflate a room past the
@@ -449,6 +476,8 @@ def solve_min_dim_fill(floorplan_data, plot_width, plot_height, capped,
     """
     fixed_indices = set(fixed_indices or ())
     base = copy.deepcopy(floorplan_data)
+    if base.get("strict_room_bounds"):
+        floors = None
     status, out_data, released = solve_min_dim(
         copy.deepcopy(base), plot_width, plot_height, capped,
         fixed_indices=fixed_indices)
@@ -658,6 +687,7 @@ def generate_mindim_rfp(ui, graph, gclass, min_width, min_height, plot_width, pl
             graph.graph_list[i].room_y, graph.graph_list[i].room_width, graph.graph_list[i].room_height,
             ui.get_edges(), enc_mat
         )
+        floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
         # If floorplan satisfying the given constraints is satisfied
         [status, out_data] = min_dim.main(floorplan_data, plot_width, plot_height)
@@ -1087,6 +1117,7 @@ def handle_single(ui, graph, drawGUI = False, gclass = None):
                 graph.graph_list[i].room_y, graph.graph_list[i].room_width, graph.graph_list[i].room_height,
                 ui.get_edges(), enc_mat
             )
+            floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
             # Storing the dummy merge nodes, and the irregular room they will be adjacent to
             dummy_node_data = {'mergednodes': graph.graph_list[i].mergednodes, 'irreg_nodes1': graph.graph_list[i].irreg_nodes1,
@@ -1524,6 +1555,7 @@ def handle_single_oc(ui, graph, drawGUI = False, gclass = None):
                 graph.graph_list[i].room_height,
                 ui.get_edges(), enc_mat
             )
+            floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
             print(floorplan_data)
             input_path = "input_to_min_dim.json"
             json_data = json.dumps(floorplan_data, indent=2)
@@ -1675,6 +1707,7 @@ def handle_multiple_oc(ui, graph, drawGUI = False, gclass = None):
                 graph.room_y[i], graph.room_width[i], graph.room_height[i],
                 ui.get_edges(), enc_mat
             )
+            floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
             # If floorplan satisfying the given constraints is satisfied
             [status, out_data] = min_dim.main(floorplan_data, plot_width, plot_height)
@@ -2127,7 +2160,8 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                 enforce_plot = False
             fill_targets = None
             fill_floors = None
-            if enforce_plot:
+            use_fill = enforce_plot or (any("priority" in n for n in getattr(ui.min_dim_inputs, "room_nodes", [])) and plot_width > 0 and plot_height > 0)
+            if use_fill:
                 # Tier-aware per-room targets for the fill solver: the
                 # allocator hands the plot's surplus to living/bedrooms and
                 # keeps service rooms small - the functionality rule the
@@ -2135,8 +2169,7 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                 # uniform-factor fallback inside solve_min_dim_fill.
                 try:
                     from GPLAN.source.dimensioning.allocator import allocate
-                    _alloc = allocate([{"name": nm} for nm in ui.get_roomNames()],
-                                      plot_width, plot_height)
+                    _alloc = allocate(_allocation_rooms(ui), plot_width, plot_height)
                     fill_targets = [(room["target_width"], room["target_height"])
                                     for room in _alloc["rooms"]]
                     # Per-room AREA quality caps for the fill probes, tiered
@@ -2168,6 +2201,8 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                         if fi < len(fill_floors):
                             fill_floors[fi] = (spec["width"], spec["height"])
                 except Exception as _exc:
+                    ui.print_gui("Room allocation could not use the requested sizing controls: %s. "
+                                 "Generation will report final room-bound violations." % _exc)
                     print("enforce_plot: allocator unavailable (%s); uniform"
                           " fill fallback" % _exc)
                     fill_targets = None
@@ -2269,6 +2304,7 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                         ui.get_edges(), enc_mat,
                         max_width=max_width, max_height=max_height
                     )
+                    floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
 
                     # print(floorplan_data)
@@ -2283,10 +2319,10 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                     # enforce_plot: the fill variant bisects a minimum-scale
                     # factor so the tiling stretches toward the plot in the
                     # SOLVER, room by room until each ceiling clamps.
-                    _solver = solve_min_dim_fill if enforce_plot else solve_min_dim
+                    _solver = solve_min_dim_fill if use_fill else solve_min_dim
                     _kw = ({"targets": fill_targets,
                             "area_caps": fill_area_caps,
-                            "floors": fill_floors} if enforce_plot else {})
+                            "floors": None if getattr(ui.min_dim_inputs, "strict_room_bounds", False) else fill_floors} if use_fill else {})
                     status, out_data, released = _solver(
                         floorplan_data, plot_width, plot_height,
                         max_width is not None or max_height is not None,
@@ -2406,6 +2442,7 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                         ui.get_edges(), enc_mat,
                         max_width=max_width, max_height=max_height
                     )
+                    floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
                     # print(floorplan_data)
                     # input_path = "input_to_min_dim.json"
@@ -2417,15 +2454,15 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
 
                     # If floorplan satisfying the given constraints is satisfied
                     # reverse order of plot width and height for the rotated pass
-                    _solver = solve_min_dim_fill if enforce_plot else solve_min_dim
+                    _solver = solve_min_dim_fill if use_fill else solve_min_dim
                     _kw = ({"targets": [None if t is None else (t[1], t[0])
                                         for t in fill_targets],
                             "area_caps": fill_area_caps,
                             "floors": [None if f is None else (f[1], f[0])
                                        for f in fill_floors]
                             if fill_floors else None}
-                           if enforce_plot and fill_targets else
-                           ({"targets": None} if enforce_plot else {}))
+                           if use_fill and fill_targets else
+                           ({"targets": None} if use_fill else {}))
                     status, out_data, released = _solver(
                         floorplan_data, plot_height, plot_width,
                         max_width is not None or max_height is not None, **_kw)
@@ -2579,6 +2616,7 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                             ui.get_edges(), enc_mat,
                             max_width=max_width, max_height=max_height
                         )
+                        floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
                         if enforce_plot and allow_rotation:
                             # A topology that overflows W x H may still fit
@@ -2773,7 +2811,8 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                 enforce_plot = False
             fill_targets = None
             fill_floors = None
-            if enforce_plot:
+            use_fill = enforce_plot or (any("priority" in n for n in getattr(ui.min_dim_inputs, "room_nodes", [])) and plot_width > 0 and plot_height > 0)
+            if use_fill:
                 # Tier-aware per-room targets for the fill solver: the
                 # allocator hands the plot's surplus to living/bedrooms and
                 # keeps service rooms small - the functionality rule the
@@ -2781,8 +2820,7 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                 # uniform-factor fallback inside solve_min_dim_fill.
                 try:
                     from GPLAN.source.dimensioning.allocator import allocate
-                    _alloc = allocate([{"name": nm} for nm in ui.get_roomNames()],
-                                      plot_width, plot_height)
+                    _alloc = allocate(_allocation_rooms(ui), plot_width, plot_height)
                     fill_targets = [(room["target_width"], room["target_height"])
                                     for room in _alloc["rooms"]]
                     # Per-room AREA quality caps for the fill probes, tiered
@@ -2803,6 +2841,8 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                     fill_floors = [(room["min_width"], room["min_height"])
                                    for room in _alloc["rooms"]]
                 except Exception as _exc:
+                    ui.print_gui("Room allocation could not use the requested sizing controls: %s. "
+                                 "Generation will report final room-bound violations." % _exc)
                     print("enforce_plot: allocator unavailable (%s); uniform"
                           " fill fallback" % _exc)
                     fill_targets = None
@@ -2853,6 +2893,7 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                         ui.get_edges(), enc_mat,
                         max_width=max_width, max_height=max_height
                     )
+                    floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
                     # Storing the dummy merge nodes, and the irregular room they will be adjacent to
                     dummy_node_data = {'mergednodes': graph.graph_list[i].mergednodes, 'irreg_nodes1': graph.graph_list[i].irreg_nodes1,
@@ -2873,10 +2914,10 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                     # enforce_plot: the fill variant bisects a minimum-scale
                     # factor so the tiling stretches toward the plot in the
                     # SOLVER, room by room until each ceiling clamps.
-                    _solver = solve_min_dim_fill if enforce_plot else solve_min_dim
+                    _solver = solve_min_dim_fill if use_fill else solve_min_dim
                     _kw = ({"targets": fill_targets,
                             "area_caps": fill_area_caps,
-                            "floors": fill_floors} if enforce_plot else {})
+                            "floors": None if getattr(ui.min_dim_inputs, "strict_room_bounds", False) else fill_floors} if use_fill else {})
                     status, out_data, released = _solver(
                         floorplan_data, plot_width, plot_height,
                         max_width is not None or max_height is not None, **_kw)
@@ -2972,6 +3013,7 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                         ui.get_edges(), enc_mat,
                         max_width=max_width, max_height=max_height
                     )
+                    floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
                     # Storing the dummy merge nodes, and the irregular room they will be adjacent to
                     dummy_node_data = {'mergednodes': graph.graph_list[i].mergednodes, 'irreg_nodes1': graph.graph_list[i].irreg_nodes1,
@@ -3103,6 +3145,7 @@ def handle_door_connectivity(ui, graph, drawGUI=False, gclass=None,
                             ui.get_edges(), enc_mat,
                             max_width=max_width, max_height=max_height
                         )
+                        floorplan_data["strict_room_bounds"] = bool(getattr(ui.min_dim_inputs, "strict_room_bounds", False))
 
                         # Storing the dummy merge nodes, and the irregular room they will be adjacent to
                         dummy_node_data = {'mergednodes': graph.graph_list[i].mergednodes, 'irreg_nodes1': graph.graph_list[i].irreg_nodes1,

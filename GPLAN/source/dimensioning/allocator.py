@@ -184,11 +184,18 @@ def allocate(rooms, plot_width, plot_height,
     ar_lo = []
     ar_hi = []
     known = []
+    priorities = []
+    explicit_priorities = any(isinstance(r, dict) and "priority" in r for r in rooms)
     for idx, room in enumerate(rooms):
         if not isinstance(room, dict):
             problems.append("room %d must be an object" % idx)
             continue
         name = str(room.get("name") or "").strip()
+        priority = room.get("priority", 1)
+        if isinstance(priority, bool) or not isinstance(priority, (int, float)) or not math.isfinite(priority) or priority < 0:
+            problems.append("%s: priority must be a finite nonnegative number" % (name or idx))
+            priority = 1
+        priorities.append(priority)
         if not name:
             problems.append("room %d has no name" % idx)
             name = "Room %d" % idx
@@ -225,6 +232,17 @@ def allocate(rooms, plot_width, plot_height,
         hh = max(hh, lh)
         la = lw * lh
         ha = max(hw * hh, la)
+        for key in ("min_area", "max_area"):
+            if key in room and (isinstance(room[key], bool) or not isinstance(room[key], (int, float)) or not math.isfinite(room[key]) or room[key] <= 0):
+                problems.append("%s: %s must be a finite positive number" % (name, key))
+        requested_min = _override(room.get("min_area"))
+        requested_max = _override(room.get("max_area"))
+        if requested_min is not None:
+            la = max(la, requested_min)
+        if requested_max is not None:
+            ha = min(ha, requested_max)
+        if ha < la:
+            problems.append("%s: max_area %g is below the required minimum %g" % (name, ha, la))
 
         band_hi = float(rule["max_aspect"])
         names.append(name)
@@ -254,6 +272,13 @@ def allocate(rooms, plot_width, plot_height,
     remainder = 0.0
     if fits:
         reaching = surplus
+        if explicit_priorities:
+            # Higher numbers receive surplus first. Within one rank retain
+            # the room-type tiers and floor-proportional water filling.
+            for priority in sorted(set(priorities), reverse=True):
+                for tier in (1, 2, 3):
+                    members = [i for i in range(len(alloc)) if priorities[i] == priority and tiers[i] == tier]
+                    reaching = _distribute(reaching, members, alloc, lo_area, hi_area)
         for tier_index, share in enumerate((float(s) for s in shares),
                                            start=1):
             if reaching <= 1e-9:
@@ -278,6 +303,17 @@ def allocate(rooms, plot_width, plot_height,
                ar_lo[i], ar_hi[i], plot_ar)
         for i in range(len(alloc))
     ]
+    for i, room in enumerate(rooms):
+        if explicit_priorities or "min_area" in room or "max_area" in room:
+            # Half-foot display rounding must not defeat an explicit area cap
+            # or floor. Preserve the allocated occupied area exactly.
+            area = alloc[i]
+            lower = max(lo_w[i], area / hi_h[i], math.sqrt(area * ar_lo[i]))
+            upper = min(hi_w[i], area / lo_h[i], math.sqrt(area * ar_hi[i]))
+            if lower > upper + 1e-6:
+                raise ValueError("%s: area and dimension/aspect bounds cannot fit together" % names[i])
+            tw = min(max(targets[i][0], lower), upper)
+            targets[i] = (tw, area / tw)
 
     total_alloc = sum(alloc)
     if total_alloc < plot_area - 1e-6:
@@ -328,6 +364,7 @@ def allocate(rooms, plot_width, plot_height,
             "canonical": canonicals[i],
             "known": known[i],
             "tier": tiers[i],
+            "priority": priorities[i],
             # everything below is RECTANGLE feet / sqft (walls included)
             "min_width": round(lo_w[i], 2),
             "min_height": round(lo_h[i], 2),

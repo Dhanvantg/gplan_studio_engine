@@ -186,7 +186,7 @@ DEFAULT_UB_FACTOR = 5
 SOLVER_UB_SLACK = float(os.environ.get("GPLAN_SOLVER_UB_SLACK", "2.5"))
 
 
-def upper_bound(supplied, low, exact=False):
+def upper_bound(supplied, low, exact=False, strict=False):
     """Upper bound for one room axis in the longest-path solve.
 
     Honours a caller-supplied maximum, widened to at least SOLVER_UB_SLACK x the
@@ -211,6 +211,8 @@ def upper_bound(supplied, low, exact=False):
         return open_ub
     if value <= 0 or value >= 99999:
         return open_ub
+    if strict:
+        return value
     return min(open_ub, max(value, SOLVER_UB_SLACK * low))
 
 
@@ -230,11 +232,11 @@ def input_constraints():
 
         low_len = float(node['min_height'])
         up_len = upper_bound(node.get('max_height'), low_len,
-                             exact=bool(node.get('is_fixed')))
+                             exact=bool(node.get('is_fixed')), strict=bool(data.get('strict_room_bounds')))
 
         low_width = float(node['min_width'])
         up_width = upper_bound(node.get('max_width'), low_width,
-                               exact=bool(node.get('is_fixed')))
+                               exact=bool(node.get('is_fixed')), strict=bool(data.get('strict_room_bounds')))
 
         lb_len.append(low_len)
         ub_len.append(up_len)
@@ -296,7 +298,7 @@ def construct_constraintgraphX(small_positive = 2):
             if color == 'red':
                 small_positive = adjacency_overlap_floor
             elif color == 'black':
-                small_positive = 2
+                small_positive = DOOR_OVERLAP_FLOOR if data.get('strict_room_bounds') else 2
 
 
             left_wall_x = 2 * x - 1
@@ -377,7 +379,7 @@ def construct_constraintgraphY(small_positive = 2):
             if color == 'red':
                 small_positive = adjacency_overlap_floor
             elif color == 'black':
-                small_positive = 2
+                small_positive = DOOR_OVERLAP_FLOOR if data.get('strict_room_bounds') else 2
 
 
             left_wall_x = 2 * x - 1
@@ -873,16 +875,19 @@ def main(input, plot_width, plot_height, overlap_floor=None):
     input_data()  # Take all the necessary inputs
     # print_input()
 
-    construct_constraintgraphX()  # Using the inputs, construct X constraint graph
-    construct_constraintgraphY()  # Construct Y constraint graph
+    required_overlap = DOOR_OVERLAP_FLOOR if data.get('strict_room_bounds') else 2
+    construct_constraintgraphX(small_positive=required_overlap)
+    construct_constraintgraphY(small_positive=required_overlap)
     # print_edges()  # Print edges for X and Y constraints
     if not compute_placement():  # Compute placements using longest path algorithm and return false if no legal placement found
         # print_placements()
         return [False, None]
     # print_placements()  # Print computed placements
-    compute_rot()
-    # print_rot()
-    edit_placements()
+    if not data.get('strict_room_bounds'):
+        # Legacy boundary compaction uses softer overlap tolerances and can
+        # invalidate the hard constraints just solved above.
+        compute_rot()
+        edit_placements()
     out_data = return_output()
     return [True, out_data]
 
